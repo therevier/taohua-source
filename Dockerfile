@@ -4,6 +4,11 @@ FROM node:24-slim
 WORKDIR /app
 ENV NODE_ENV=production
 
+# Python 运行时（可选：让 Python 任务也能在沙箱里运行）
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 # 只拷贝依赖清单，利用 Docker 层缓存
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
