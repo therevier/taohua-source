@@ -13,6 +13,7 @@ import type { CodeRunner } from '../infra/runner';
 import type { KeyValueStore } from '../infra/store';
 import { HttpError } from '../errors';
 import type { PlanService } from './plan';
+import { buildExtensionFallback } from './fallback-plans';
 import { evaluateStall } from './stall';
 
 interface LadderState {
@@ -33,6 +34,8 @@ export interface StoredSession {
   chat: ChatTurn[];
   ladder: LadderState;
   activity: ActivitySnapshot | null;
+  /** 当前步骤连续提交失败次数（用于升级引导、防止卡死） */
+  submitAttempts: number;
 }
 
 export interface TutorDeps {
@@ -102,7 +105,7 @@ export class TutorService {
       .slice(0, limit);
   }
 
-  /** 知识库：把每个「已完成步骤」沉淀成知识卡片（标题 + 一句话摘要） */
+  /** 知识库：把每个「已完成步骤」沉淀成知识卡片（概念 + 一句话摘要） */
   listKnowledge(limit = 100): KnowledgeCard[] {
     const cards: KnowledgeCard[] = [];
     for (const { value: session, updatedAt } of this.deps.store.all()) {
@@ -112,7 +115,7 @@ export class TutorService {
         cards.push({
           id: `${session.id}:${task.id}`,
           project: session.plan.title,
-          title: task.title,
+          title: task.concept || task.title,
           summary: task.explain || task.goal,
           sessionId: session.id,
           at: updatedAt || session.createdAt,
@@ -140,13 +143,20 @@ export class TutorService {
       chat: [],
       ladder: { level: 0, hintCount: 0, lastHintAt: null },
       activity: null,
+      submitAttempts: 0,
     };
-    // 导师开场：欢迎 + 第一步的清晰指令（不堆砌）
+    // 导师开场：欢迎 + 本课概念预告 + 第一步的零基础指令
     const firstTask = plan.tasks[0];
     if (firstTask) {
+      const concepts = plan.tasks
+        .map((task) => task.concept)
+        .filter((concept): concept is string => Boolean(concept && concept.trim()));
       session.chat.push({
         role: 'tutor',
-        content: `欢迎来到「桃花源码」🌸 今天做：${plan.title}\n\n第一步 · ${firstTask.title}\n${firstTask.brief}`,
+        content:
+          `欢迎来到「桃花源码」🌸 今天做：${plan.title}` +
+          (concepts.length > 0 ? `\n本课会学到：${concepts.join('、')}（每步只教一个，从零开始）` : '') +
+          `\n\n第一步 · ${firstTask.title}\n${this.formatBrief(firstTask)}`,
         at: Date.now(),
         level: null,
       });
@@ -165,6 +175,10 @@ export class TutorService {
     const session = this.mustGet(id);
     const trimmed = message.trim();
     if (!trimmed) throw new HttpError(400, '消息不能为空');
+
+    const finishedReply = await this.tryExtendOrReplyFinished(session, trimmed);
+    if (finishedReply) return finishedReply;
+
     const task = this.currentTask(session);
     const history = session.chat.slice();
     session.chat.push({ role: 'student', content: trimmed, at: Date.now() });
@@ -190,6 +204,12 @@ export class TutorService {
     const session = this.mustGet(id);
     const trimmed = message.trim();
     if (!trimmed) throw new HttpError(400, '消息不能为空');
+
+    const finishedReply = await this.tryExtendOrReplyFinished(session, trimmed, onDelta);
+    if (finishedReply) {
+      return finishedReply.session;
+    }
+
     const task = this.currentTask(session);
     const history = session.chat.slice();
     session.chat.push({ role: 'student', content: trimmed, at: Date.now() });
@@ -208,6 +228,87 @@ export class TutorService {
     session.chat.push({ role: 'tutor', content: full, at: Date.now(), level: null });
     this.persist(session);
     return this.toPublic(session);
+  }
+
+  /**
+   * 项目已完成时的对话：识别「继续完善」意图 → 生成新的教学步骤；
+   * 否则给一句简短指引。返回 null 表示项目未完成，走正常对话。
+   */
+  private async tryExtendOrReplyFinished(
+    session: StoredSession,
+    message: string,
+    onDelta?: (text: string) => void,
+  ): Promise<{ reply: string; session: SessionState } | null> {
+    if (!this.isFinished(session)) return null;
+    if (this.looksLikeExtension(message)) {
+      try {
+        const { session: updated } = await this.extendSession(session.id, message);
+        const reply = updated.chat[updated.chat.length - 1]?.content ?? '';
+        if (onDelta) onDelta(reply);
+        return { reply, session: updated };
+      } catch (err) {
+        console.warn('[tutor] 扩展失败:', err instanceof Error ? err.message : err);
+      }
+    }
+    const reply =
+      '这个项目已经完成啦！想继续完善的话，告诉我「想加一个什么功能」，我会给你生成新的教学步骤。';
+    session.chat.push({ role: 'student', content: message, at: Date.now() });
+    session.chat.push({ role: 'tutor', content: reply, at: Date.now(), level: null });
+    this.persist(session);
+    if (onDelta) onDelta(reply);
+    return { reply, session: this.toPublic(session) };
+  }
+
+  /** 项目是否已全部完成 */
+  private isFinished(session: StoredSession): boolean {
+    return session.currentTaskIndex >= session.plan.tasks.length;
+  }
+
+  /** 粗判「继续完善」意图（项目完成后才生效） */
+  private looksLikeExtension(message: string): boolean {
+    return /加一个|加个|添加|加点|再加|继续|完善|扩展|升级|功能/i.test(message);
+  }
+
+  /**
+   * 「继续完善」：基于已完成项目 + 学生的新需求，生成新的教学步骤并追加。
+   * LLM 不可用或质量闸门拒绝时，用内置扩展任务兜底（清单→加功能→整合）。
+   */
+  async extendSession(id: string, request: string): Promise<{ added: number; session: SessionState }> {
+    const session = this.mustGet(id);
+    const trimmed = request.trim();
+    if (!trimmed) throw new HttpError(400, '说说想给项目加点什么功能？');
+
+    session.chat.push({ role: 'student', content: trimmed, at: Date.now() });
+
+    const baseCount = session.plan.tasks.length;
+    const generated = await this.deps.plan.generateExtension(
+      {
+        title: session.plan.title,
+        overview: session.plan.overview,
+        language: session.plan.language,
+        tasks: session.plan.tasks.map((task) => ({ title: task.title, concept: task.concept })),
+      },
+      trimmed,
+    );
+    const extTasks =
+      generated && generated.length > 0
+        ? generated
+        : buildExtensionFallback(session.plan.title, session.plan.language);
+
+    extTasks.forEach((task, index) => {
+      session.plan.tasks.push({ ...task, id: `ext-${baseCount + index + 1}` });
+    });
+    session.currentTaskIndex = baseCount;
+    session.ladder = { level: 0, hintCount: 0, lastHintAt: null };
+    const first = session.plan.tasks[baseCount];
+    session.chat.push({
+      role: 'tutor',
+      content: `✓ 太好了，我们继续完善它！\n\n新的一步 · ${first.title}\n${this.formatBrief(first)}`,
+      at: Date.now(),
+      level: null,
+    });
+    this.persist(session);
+    return { added: extTasks.length, session: this.toPublic(session) };
   }
 
   /* ---------------- 卡壳检测 + 提示阶梯 ---------------- */
@@ -267,29 +368,29 @@ export class TutorService {
 
     const run = await this.deps.runner.run(code, task.language);
     let passed = this.evaluateAcceptance(task, run);
-    let failReason = '';
+    let auditNote = '';
 
     // 防作弊：输出通过后，再用模型审核代码是否真的实现了逻辑（而不是直接打印结果）
     if (passed) {
       const auditPassed = await this.auditSubmission(task, code);
       if (!auditPassed) {
         passed = false;
-        failReason =
-          '输出对了，但代码看起来只是直接打印了结果，没有实现真正的逻辑。请先实现函数/循环/判断，再提交。';
+        auditNote = '输出对了，但代码看起来只是直接打印了结果，没有实现真正的逻辑。';
       }
     }
 
     if (!passed) {
-      const reason =
-        failReason ||
-        (run.stderr.trim()
-          ? `本次运行报错：${run.stderr.trim().split('\n')[0]}`
-          : '输出还没有满足验收标准，对照注释里的期望输出再检查一遍。');
-      session.chat.push({ role: 'tutor', content: `还没有通过验收：${reason}`, at: Date.now(), level: null });
+      // 老师审阅：不直接判"不符合"，而是读代码、给出具体问题与修改引导
+      const attempts = (session.submitAttempts ?? 0) + 1;
+      session.submitAttempts = attempts;
+      const feedback = await this.reviewSubmission(task, code, run, attempts);
+      const reason = (auditNote ? `${auditNote}\n\n` : '') + feedback;
+      session.chat.push({ role: 'tutor', content: `还没有通过。${reason}`, at: Date.now(), level: null });
       this.persist(session);
       return { passed: false, reason, session: this.toPublic(session) };
     }
 
+    session.submitAttempts = 0;
     session.completedTaskIds.push(task.id);
     const nextIndex = index + 1;
     session.currentTaskIndex = nextIndex;
@@ -301,7 +402,7 @@ export class TutorService {
       role: 'tutor',
       content: done
         ? `🎉 ${explain}\n\n全部完成：${session.plan.tasks.map((item) => item.title).join(' → ')}`
-        : `✓ ${explain}\n\n下一步 · ${nextTask?.title ?? ''}\n${nextTask?.brief ?? ''}`,
+        : `✓ ${explain}\n\n下一步 · ${nextTask?.title ?? ''}\n${nextTask ? this.formatBrief(nextTask) : ''}`,
       at: Date.now(),
       level: null,
     });
@@ -414,6 +515,67 @@ export class TutorService {
     );
     if (!verdict) return true;
     return !/FAIL/i.test(verdict);
+  }
+
+  /**
+   * 提交失败后的「老师审阅」：读学生的代码和实际输出，给出具体问题与修改引导，
+   * 而不是像做题网站一样只报「不符合验收」。连续失败逐步升级引导（写法模板 → 完整参考）防止卡死。
+   */
+  private async reviewSubmission(task: TaskNode, code: string, run: RunResult, attempts: number): Promise<string> {
+    let feedback = '';
+    if (this.deps.llm.enabled) {
+      const expected =
+        task.acceptance.type === 'output_contains'
+          ? `输出里要包含「${task.acceptance.value ?? ''}」`
+          : '程序能正常运行';
+      const verdict = await this.deps.llm.chatJSON<{ nearPass?: boolean; feedback?: string }>(
+        [
+          {
+            role: 'system',
+            content:
+              '你是「桃花源码」的审阅老师。学生提交了这一步的代码但没有通过验收。请先读懂学生的代码思路，再给出具体、循序渐进的反馈：说明哪里没达到要求、怎么改，语言温和具体，不要只说不符合，也不要直接给完整答案。只输出 JSON。',
+          },
+          {
+            role: 'user',
+            content:
+              `任务：${task.title}\n目标：${task.goal}\n要求：${task.brief}\n验收：${expected}\n\n` +
+              `学生代码：\n\`\`\`${task.language}\n${truncate(code, 3000)}\n\`\`\`\n\n` +
+              `实际运行输出：\n${truncate(run.stdout.trim() || '（无输出）', 800)}\n` +
+              `运行错误：${truncate(run.stderr.trim() || '无', 400)}\n\n` +
+              '重点：逐字对比「实际运行输出」与验收要求；如果输出不一致，请明确指出哪里不一致（例如少了逗号、文字不同、没打印、顺序不对）。\n' +
+              '输出 JSON：{"nearPass": true 或 false, "feedback": "2-4 句具体反馈（问题 + 怎么改）"}',
+          },
+        ],
+        { temperature: 0.3, maxTokens: 320, json: true },
+      );
+      if (verdict?.feedback) feedback = String(verdict.feedback).trim();
+    }
+    if (!feedback) {
+      // 离线兜底：基于实际输出与期望的差异，给出具体提示
+      const expected = task.acceptance.type === 'output_contains' ? task.acceptance.value ?? '' : '';
+      if (run.stderr.trim()) {
+        feedback = `程序报错了：${run.stderr.trim().split('\n')[0]}。先看报错提到的位置，再对照示例检查这一行。`;
+      } else if (expected) {
+        feedback = `你的程序输出是「${truncate(run.stdout.trim() || '（无输出）', 80)}」，这一步期望输出里包含「${expected}」。对照示例一行一行看，找找哪里没对上。`;
+      } else {
+        feedback = '输出还没符合要求。对照示例检查：是不是有代码没写、没调用，或者打印的内容和示例不一致？';
+      }
+    }
+    if (attempts >= 4) {
+      feedback += `\n\n（这几次都差一点，给你一份修正参考，先看懂它，再关掉自己重写一遍：）\n\`\`\`${task.language}\n${task.reference.trim()}\n\`\`\``;
+    } else if (attempts >= 3) {
+      feedback += `\n\n再提示一下写法：${task.hints.L3}`;
+    }
+    return feedback;
+  }
+
+  /** 组装「老师这一步的话」：任务指令 + 可运行示例（零基础先读例子再动手） */
+  private formatBrief(task: TaskNode): string {
+    let text = task.brief;
+    if (task.example && task.example.trim()) {
+      text += `\n\n示例代码：\n${task.example.trim()}`;
+    }
+    return text;
   }
 
   private persist(session: StoredSession): void {

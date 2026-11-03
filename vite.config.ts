@@ -11,7 +11,19 @@ export default defineConfig({
   plugins: [react()],
   server: {
     watch: {
-      ignored: ['**/*.tmp', '**/*.tmpdir/**', '**/.*.tmpdir/**', '**/data/**', '**/*.db', '**/*.db-*'],
+      ignored: [
+        '**/*.tmp',
+        '**/*.tmpdir/**',
+        '**/.*.tmpdir/**',
+        '**/data/**',
+        '**/*.db',
+        '**/*.db-*',
+        '**/*.mp4',
+        '**/*.webm',
+        '**/*.mov',
+        '**/*.pptx',
+        '**/*.pdf',
+      ],
     },
   },
   build: {

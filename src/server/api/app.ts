@@ -148,6 +148,16 @@ export function createApiRouter(tutor: TutorService): express.Router {
     }),
   );
 
+  /** 项目完成后继续完善：生成新的教学步骤并追加 */
+  router.post(
+    '/sessions/:id/extend',
+    wrap(async (req, res) => {
+      const body = (req.body ?? {}) as { request?: unknown };
+      const outcome = await tutor.extendSession(req.params.id, String(body.request ?? ''));
+      res.json(outcome);
+    }),
+  );
+
   router.post(
     '/sessions/:id/run',
     wrap(async (req, res) => {

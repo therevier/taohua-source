@@ -142,4 +142,7 @@ export const api = {
       taskId,
       code,
     }),
+
+  extend: (id: string, request: string) =>
+    post<{ added: number; session: SessionState }>(`/api/sessions/${id}/extend`, { request }),
 };

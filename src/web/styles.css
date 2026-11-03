@@ -839,6 +839,47 @@ textarea:focus {
   margin-top: 8px;
 }
 
+/* ---------- 继续完善 ---------- */
+.extend-box {
+  margin-top: 20px;
+  padding: 14px 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 14px;
+  background: var(--panel);
+}
+
+.extend-title {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.extend-input {
+  display: flex;
+  gap: 8px;
+}
+
+.extend-input input {
+  flex: 1;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.extend-input input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.extend-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 /* ---------- 完成页 ---------- */
 .finish {
   max-width: 640px;

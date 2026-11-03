@@ -66,25 +66,7 @@ async function streamChat(sessionId, message, code) {
   return { deltas, session };
 }
 
-const TODO_SOLUTION = `function addTodo(list, text) {
-  const item = { id: list.length + 1, text, done: false };
-  list.push(item);
-  return item;
-}
-
-function listTodos(list) {
-  for (const item of list) {
-    console.log((item.done ? '[x] ' : '[ ] ') + item.text);
-  }
-}
-
-const list = [];
-addTodo(list, '买牛奶');
-addTodo(list, '学 JavaScript');
-list[1].done = true;
-listTodos(list);
-console.log('通过:', list.length === 2 && list[0].text === '买牛奶' && list[1].done === true);
-`;
+const SOLUTION = `console.log('你好，桃花源');\n`;
 
 async function main() {
   console.log(`[smoke] 目标服务: ${BASE}`);
@@ -148,7 +130,7 @@ async function main() {
   if (!llmMode) {
     const okComplete = await api('POST', `/api/sessions/${session.id}/complete`, {
       taskId: task.id,
-      code: TODO_SOLUTION,
+      code: SOLUTION,
     });
     check(okComplete.passed === true, '写对后提交通过验收（离线模板）');
     check(okComplete.session.currentTaskIndex === 1, '通过后自动进入第 2 步');

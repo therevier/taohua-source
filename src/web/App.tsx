@@ -43,6 +43,8 @@ export default function App() {
   const [pendingUser, setPendingUser] = useState<string | null>(null);
   const [streamingText, setStreamingText] = useState('');
   const [showEntry, setShowEntry] = useState(false);
+  /** 项目完成后「继续完善」的生成中状态 */
+  const [extending, setExtending] = useState(false);
 
   const tasks = session?.plan.tasks ?? [];
   const currentTask: PublicTask | null = session ? (tasks[session.currentTaskIndex] ?? null) : null;
@@ -259,7 +261,7 @@ export default function App() {
   async function handleSend(message: string) {
     const s = sessionRef.current;
     const task = taskRef.current;
-    if (!s || !task || sending) return;
+    if (!s || sending) return;
     setSending(true);
     setError(null);
     setPendingUser(message);
@@ -276,6 +278,24 @@ export default function App() {
       setSending(false);
       setPendingUser(null);
       setStreamingText('');
+    }
+  }
+
+  /** 项目完成后：继续完善，生成新的教学步骤 */
+  async function handleExtend(request: string) {
+    const s = sessionRef.current;
+    if (!s || extending) return;
+    setExtending(true);
+    setError(null);
+    try {
+      const outcome = await api.extend(s.id, request);
+      setSession(outcome.session);
+      setRunResult(null);
+      resetActivity();
+    } catch (err) {
+      showError(err);
+    } finally {
+      setExtending(false);
     }
   }
 
@@ -394,7 +414,24 @@ export default function App() {
         </div>
       )}
       {finished ? (
-        <FinishPanel session={session} onReset={handleReset} onOpenKnowledge={openKnowledge} />
+        <main className="layout">
+          <ChatPanel
+            turns={session.chat}
+            sending={sending}
+            pendingUser={pendingUser}
+            streamingText={streamingText}
+            onSend={handleSend}
+          />
+          <section className="work">
+            <FinishPanel
+              session={session}
+              onReset={handleReset}
+              onOpenKnowledge={openKnowledge}
+              onExtend={(request) => void handleExtend(request)}
+              extending={extending}
+            />
+          </section>
+        </main>
       ) : currentTask ? (
         <main className="layout">
           <ChatPanel

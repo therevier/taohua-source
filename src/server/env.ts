@@ -38,8 +38,10 @@ export interface AppConfig {
 export function loadConfig(): AppConfig {
   loadDotEnv();
   const apiKey = process.env.LLM_API_KEY || process.env.OPENAI_API_KEY || '';
+  // Hugging Face Spaces 固定监听 7860（通过 SPACE_ID 环境变量自动识别）
+  const defaultPort = process.env.SPACE_ID ? 7860 : 8787;
   return {
-    port: Number(process.env.PORT || 8787),
+    port: Number(process.env.PORT || defaultPort),
     llm: {
       enabled: Boolean(apiKey),
       apiKey,
